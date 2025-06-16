@@ -251,22 +251,71 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
-    @torch.inference_mode()
+    @torch.inference_mode() # 相比于 torch.no_grad()，inference_mode() 更加高效，因为它还会优化内存使用和计算图构建。
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill):
+        """
+        args:
+            input_ids: 当前 batch 的 token IDs，形状为 (batch_size, seq_len)。
+            positions: token 的位置索引，用于位置编码。
+            is_prefill: 布尔值，表示是否是预填充阶段（prefill）。如果是，则处理的是长序列的首次推理。
+
+        +----------------------------+
+        |         run_model()         |
+        +----------------------------+
+                    ↓
+             是否使用 CUDA Graph?
+               ┌───────────────┐
+               │               │
+           是 prefilled?    batch > 512?
+               │               │
+               └──────┬────────┘
+                      ↓
+             +-------------------+
+             | 直接前向传播推理     |
+             | model(input_ids, ...)|
+             +-------------------+
+                      ↓
+             返回 logits 给 sampler
+        
+                      ↓
+              +------------------+
+              | 使用 CUDA Graph   |
+              | 加载对应 batch 图 |
+              | 拷贝输入进 buffer |
+              | replay()          |
+              +------------------+
+                      ↓
+             返回 logits 给 sampler
+        """
+        # 判断是否使用 eager 模式或直接推理
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            """
+            is_prefill == True：当前是“预填充”阶段（即处理 prompt 阶段），通常序列较长，不适合使用 CUDA 图加速。
+            self.enforce_eager == True：用户强制要求不使用 CUDA 图。
+            input_ids.size(0) > 512：批量太大，超出了预先捕获的 CUDA 图支持的最大 batch size。
+            直接调用模型的 forward 方法进行前向传播；
+            然后通过 compute_logits(...) 获取最终的输出 logits；
+            这是最简单、最通用的执行方式。
+            """
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
-            bs = input_ids.size(0)
-            context = get_context()
-            self.reset_graph_vars()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
+            bs = input_ids.size(0) # 获取 batch size
+            context = get_context() # 获取上下文信息
+            self.reset_graph_vars() # 重置图变量缓存, 清除之前缓存的输入数据，避免脏数据干扰。通常会重置 input_ids, positions, outputs 等张量。
+            '''
+            作用：
+                从预先捕获好的多个 CUDA 图中选择一个能容纳当前 batch 大小的图。
+                self.graph_bs 是一个排序好的列表，比如 [1, 4, 16, 64, 256, 512]；
+                使用 next(...) 找到第一个大于等于当前 bs 的项作为匹配项。
+            '''
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 选择合适 batch size 的 CUDA 图
+            graph_vars = self.graph_vars # 包含所有需要提前分配的张量缓冲区
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
+            graph.replay() # 执行之前捕获的 CUDA 图，快速完成整个前向传播过程。节省了每次调用模型时重新构建计算图的开销；特别适合固定输入 shape 的 decode 阶段；性能提升可达数倍。
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def reset_graph_vars(self):
@@ -287,27 +336,54 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        '''
+        负责在模型推理阶段预先捕获 CUDA Graph（CUDA 计算图），以便在后续的 decode 阶段进行高性能、低延迟的图回放（graph replay）。
+        '''
         get_rng_state = torch.cuda.get_rng_state
         set_rng_state = torch.cuda.set_rng_state
         rng_state = torch.cuda.get_rng_state()
         torch.cuda.get_rng_state = lambda: rng_state
         torch.cuda.set_rng_state = lambda _: None
-    
+        '''
+        以上代码:
+            冻结当前 GPU 的随机数生成器状态（RNG），避免 CUDA 图中出现不可预测的操作（如 dropout、随机初始化等）导致图无法复现。
+        '''
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        '''
+        配置信息提取：
+            hf_config: HuggingFace 模型配置；
+            max_bs: 最大 batch size，取 max_num_seqs 和 512 中较小者；
+            max_num_blocks: 根据最大序列长度和块大小计算出的最大 KV 缓存块数量（用于 PagedAttention）。
+        '''
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) # 定义一组支持的 batch size（例如 [1, 2, 4, 8, 16, 32, ..., 512]）, 用于后续匹配合适的 CUDA Graph
+        self.graphs = {} # self.graphs: 存储每个 batch size 对应的 CUDA Graph
+        self.graph_pool = None # self.graph_pool: 图池，用于重用内存分配资源。
 
         for bs in reversed(self.graph_bs):
+            '''
+            ✅ 循环逻辑详解：
+                按从大到小顺序遍历所有支持的 batch size；
+                创建新的 CUDAGraph() 实例；
+                调用 set_context(...) 设置当前上下文（模拟请求的 slot mapping、block table 等）；
+                第一次前向传播（warmup）：
+                执行一次模型前向传播，预热 GPU，防止首次运行引入额外开销；
+                第二次前向传播（图捕获）：
+                使用 with torch.cuda.graph(graph, pool): 捕获整个计算过程；
+                这次不会立即执行，而是记录成图；
+                首次捕获后保存图池；
+                保存当前 batch size 对应的图到 self.graphs 字典中；
+                同步设备，确保图构建完成；
+                调用 reset_context() 清除临时上下文
+            '''
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
