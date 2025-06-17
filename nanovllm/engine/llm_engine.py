@@ -11,6 +11,20 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+'''
+atexit: 用于在程序退出时执行清理操作。
+dataclasses.fields: 获取类的数据字段。
+perf_counter: 高精度计时器，用于性能分析。
+tqdm: 进度条显示。
+transformers: HuggingFace 提供的库，用于加载预训练模型和 tokenizer。
+torch.multiprocessing: PyTorch 多进程支持。
+自定义模块：
+Config: 模型配置。
+SamplingParams: 控制采样参数（如 temperature、top_p 等）。
+Sequence: 表示一个序列请求。
+Scheduler: 调度器，管理待处理的序列。
+ModelRunner: 实际运行模型推理的模块。
+'''
 
 class LLMEngine:
 
@@ -20,13 +34,13 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
-        for i in range(1, config.tensor_parallel_size):
+        for i in range(1, config.tensor_parallel_size): # 根据 tensor_parallel_size 启动多个 ModelRunner 子进程（每个对应一个 GPU），用于并行推理。
             event = mp.Event()
             process = mp.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events) # 主进程使用 ModelRunner（rank 为 0）进行主控推理。
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
